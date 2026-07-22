@@ -1,0 +1,402 @@
+import boto3
+import json
+import os
+import logging
+import time
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+name          = os.environ["NAME"]
+env           = os.environ["ENV_NAME"]
+ssm_parameter = os.environ["SSM_PARAMETER"]
+
+templateBase = {
+    "AWSTemplateFormatVersion": "2010-09-09",
+}
+
+ec2            = boto3.client("ec2")
+cloudformation = boto3.client("cloudformation")
+ssm            = boto3.client("ssm")
+
+
+def get_eni_config():
+    """
+    Step 1 - reads full ENI config from SSM parameter
+    """
+    try:
+        logger.info(f"Reading ENI config from SSM: {ssm_parameter}")
+        response = ssm.get_parameter(Name=ssm_parameter)
+        config   = json.loads(response["Parameter"]["Value"])
+        logger.info(f"Step 1 - ENI config loaded from SSM successfully")
+        logger.info(f"Step 2 - SSM config: {json.dumps(config)}")
+        return config
+    except Exception as e:
+        logger.error(f"Step 1 - Failed to read SSM parameter: {str(e)}")
+        raise
+
+
+def release_ip_if_in_use(private_ip, exclude_eni_id=None):
+    """
+    Checks if IP is already in use by another ENI
+    releases it if found so CFN can assign it
+    waits for release to complete before returning
+    handles all cases:
+    - orphaned available ENI from previous CFN stack
+    - secondary IP on attached ENI
+    - primary IP warning only
+    """
+    try:
+        if not private_ip:
+            return
+
+        logger.info(f"Checking if {private_ip} is already in use")
+        existing_enis = ec2.describe_network_interfaces(
+            Filters=[{
+                "Name":   "addresses.private-ip-address",
+                "Values": [private_ip]
+            }]
+        )
+
+        if not existing_enis["NetworkInterfaces"]:
+            logger.info(f"IP {private_ip} is not in use - safe to assign")
+            return
+
+        for existing_eni in existing_enis["NetworkInterfaces"]:
+            existing_eni_id = existing_eni["NetworkInterfaceId"]
+            status          = existing_eni["Status"]
+
+            # skip if same ENI
+            if exclude_eni_id and existing_eni_id == exclude_eni_id:
+                logger.info(f"IP {private_ip} already on same ENI {existing_eni_id} - skipping")
+                continue
+
+            logger.info(f"Found IP {private_ip} on ENI: {existing_eni_id}, Status: {status}")
+
+            if status == "available":
+                # ENI not attached - safe to delete
+                logger.info(f"Deleting orphaned ENI: {existing_eni_id}")
+                ec2.delete_network_interface(
+                    NetworkInterfaceId=existing_eni_id
+                )
+                logger.info(f"Orphaned ENI deleted: {existing_eni_id}")
+
+                # wait for deletion to complete
+                logger.info(f"Waiting for ENI deletion to complete")
+                time.sleep(5)
+
+                # verify deletion
+                try:
+                    verify = ec2.describe_network_interfaces(
+                        NetworkInterfaceIds=[existing_eni_id]
+                    )
+                    if verify["NetworkInterfaces"]:
+                        logger.warning(f"ENI {existing_eni_id} still exists after deletion")
+                    else:
+                        logger.info(f"ENI {existing_eni_id} confirmed deleted")
+                except Exception:
+                    logger.info(f"ENI {existing_eni_id} confirmed deleted")
+
+            elif status == "in-use":
+                # check if it is a secondary IP - safe to unassign
+                for ip in existing_eni["PrivateIpAddresses"]:
+                    if ip["PrivateIpAddress"] == private_ip and not ip["Primary"]:
+                        logger.info(f"Unassigning secondary IP {private_ip} from ENI: {existing_eni_id}")
+                        ec2.unassign_private_ip_addresses(
+                            NetworkInterfaceId=existing_eni_id,
+                            PrivateIpAddresses=[private_ip]
+                        )
+                        logger.info(f"Secondary IP {private_ip} unassigned from ENI: {existing_eni_id}")
+
+                        # wait for unassignment to complete
+                        logger.info(f"Waiting for IP unassignment to complete")
+                        time.sleep(5)
+
+                        # verify unassignment
+                        verify_enis = ec2.describe_network_interfaces(
+                            Filters=[{
+                                "Name":   "addresses.private-ip-address",
+                                "Values": [private_ip]
+                            }]
+                        )
+                        if verify_enis["NetworkInterfaces"]:
+                            logger.warning(f"IP {private_ip} still in use after unassignment")
+                        else:
+                            logger.info(f"IP {private_ip} confirmed released")
+                        break
+
+                    elif ip["PrivateIpAddress"] == private_ip and ip["Primary"]:
+                        logger.warning(f"IP {private_ip} is primary on ENI {existing_eni_id} - cannot unassign")
+
+        # final check - verify IP is actually free
+        logger.info(f"Final check - verifying {private_ip} is free")
+        final_check = ec2.describe_network_interfaces(
+            Filters=[{
+                "Name":   "addresses.private-ip-address",
+                "Values": [private_ip]
+            }]
+        )
+
+        still_in_use = [
+            eni for eni in final_check["NetworkInterfaces"]
+            if not exclude_eni_id or eni["NetworkInterfaceId"] != exclude_eni_id
+        ]
+
+        if still_in_use:
+            logger.error(f"IP {private_ip} still in use after release attempt")
+            for eni in still_in_use:
+                logger.error(f"Still in use by ENI: {eni['NetworkInterfaceId']} Status: {eni['Status']}")
+        else:
+            logger.info(f"IP {private_ip} confirmed free and ready to use")
+
+    except Exception as e:
+        logger.error(f"Failed to release IP {private_ip}: {str(e)}")
+        raise
+
+
+def release_all_ips(config, az):
+    """
+    Releases all static IPs before creating CFN stack
+    ensures no IP conflicts when CFN creates ENIs
+    called before building CFN resources
+    """
+    try:
+        logger.info(f"Step 7a - Releasing all static IPs for AZ: {az}")
+
+        for device, eni in enumerate(config["eni_config"]):
+            private_ip = eni.get("private_ip")
+            if isinstance(private_ip, dict):
+                private_ip = private_ip.get(az)
+
+            if private_ip:
+                logger.info(f"Step 7a - Releasing IP for device {device}: {private_ip}")
+                release_ip_if_in_use(private_ip)
+
+        logger.info(f"Step 7a - All static IPs released successfully")
+
+    except Exception as e:
+        logger.error(f"Step 7a - Failed to release IPs: {str(e)}")
+        raise
+
+
+def eniToResources(azConfig, az, device, eni, instanceId):
+    """
+    Builds CloudFormation resources for a single ENI
+    called for each entry in eni_config
+    handles eth1 eth2 eth3
+    eth0 mgmt handled by Terraform pre-created ENI
+    """
+    try:
+        subnetType   = eni["subnet_type"]
+        device_index = eni.get("device_index", device + 1)
+
+        # get static private IP for this AZ
+        private_ip = eni.get("private_ip")
+        if isinstance(private_ip, dict):
+            private_ip = private_ip.get(az)
+
+        logger.info(f"ENI - Device: {device}, Index: {device_index}, AZ: {az}, SubnetType: {subnetType}, PrivateIP: {private_ip}")
+
+        # build ENI properties
+        eni_properties = {
+            "Description": f"eth {device + 1}/1",
+            "GroupSet":    eni["sgs"],
+            "SubnetId":    azConfig["subnets"][subnetType],
+        }
+
+        # only add PrivateIpAddress if not None
+        if private_ip:
+            eni_properties["PrivateIpAddress"] = private_ip
+
+        resources = {
+            # create ENI in correct subnet with static IP
+            f"Eni{device}": {
+                "Type":           "AWS::EC2::NetworkInterface",
+                "DeletionPolicy": "RetainExceptOnCreate",
+                "Properties":     eni_properties,
+            },
+            # attach ENI to instance at correct device index
+            f"EniAttachment{device}": {
+                "Type":           "AWS::EC2::NetworkInterfaceAttachment",
+                "DeletionPolicy": "RetainExceptOnCreate",
+                "Properties": {
+                    "DeleteOnTermination": True,
+                    "DeviceIndex":         device + 1,
+                    "InstanceId":          instanceId,
+                    "NetworkInterfaceId":  {"Ref": f"Eni{device}"},
+                },
+            },
+        }
+
+        # only public/external subnet ENIs get EIP
+        if subnetType == "public":
+            eip_allocation_id = eni.get("eip_allocation_id")
+            if isinstance(eip_allocation_id, dict):
+                eip_allocation_id = eip_allocation_id.get(az)
+
+            logger.info(f"ENI - External ENI - EIP: {eip_allocation_id}, PrivateIP: {private_ip}")
+
+            if eip_allocation_id:
+                # use pre-existing static EIP
+                eip_properties = {
+                    "AllocationId":       eip_allocation_id,
+                    "NetworkInterfaceId": {"Ref": f"Eni{device}"},
+                }
+                if private_ip:
+                    eip_properties["PrivateIpAddress"] = private_ip
+
+                resources[f"EipAttachment{device}"] = {
+                    "Type":           "AWS::EC2::EIPAssociation",
+                    "DeletionPolicy": "RetainExceptOnCreate",
+                    "Properties":     eip_properties,
+                }
+            else:
+                # create new EIP dynamically
+                resources[f"Eip{device}"] = {
+                    "Type":           "AWS::EC2::EIP",
+                    "DeletionPolicy": "RetainExceptOnCreate",
+                    "Properties": {
+                        "Domain": "vpc",
+                        "Tags":   [{"Key": "Name", "Value": f"eth {device + 1}/1"}],
+                    },
+                }
+
+                eip_properties = {
+                    "AllocationId":       {"Fn::GetAtt": [f"Eip{device}", "AllocationId"]},
+                    "NetworkInterfaceId": {"Ref": f"Eni{device}"},
+                }
+                if private_ip:
+                    eip_properties["PrivateIpAddress"] = private_ip
+
+                resources[f"EipAttachment{device}"] = {
+                    "Type":           "AWS::EC2::EIPAssociation",
+                    "DeletionPolicy": "RetainExceptOnCreate",
+                    "Properties":     eip_properties,
+                }
+
+        logger.info(f"ENI - Resources built successfully for device {device}")
+        return resources
+
+    except Exception as e:
+        logger.error(f"ENI - Failed to build resources for device {device}: {str(e)}")
+        raise
+
+
+def handler(event, context):
+    logger.info("Lambda handler started")
+    logger.info(f"Event received: {json.dumps(event)}")
+
+    # Step 1 - read full ENI config from SSM
+    try:
+        logger.info("Step 3 - Loading ENI config from SSM")
+        config = get_eni_config()
+        logger.info("Step 4 - ENI config loaded successfully")
+    except Exception as e:
+        logger.error(f"Step 3 - Failed to load SSM config: {str(e)}")
+        raise
+
+    for record in event["Records"]:
+        try:
+            # Step 5 - parse SQS message
+            data = json.loads(record["body"])["detail"]
+            logger.info(f"Step 5 - Lifecycle event: {json.dumps(data)}")
+
+            instanceId = data["EC2InstanceId"]
+            logger.info(f"**************** Processing instance: {instanceId}")
+
+            # Step 6 - describe instance to get AZ and state
+            describeInstances = ec2.describe_instances(InstanceIds=[instanceId])
+            if len(describeInstances["Reservations"]) < 1 or len(describeInstances["Reservations"][0]["Instances"]) < 1:
+                logger.warning(f"Instance not found: {instanceId}")
+                continue
+
+            instance = describeInstances["Reservations"][0]["Instances"][0]
+            az       = instance["Placement"]["AvailabilityZone"]
+            state    = instance["State"]["Name"]
+
+            logger.info(f"Step 6 - Instance {instanceId} - AZ: {az}, State: {state}")
+
+            if state not in ["pending", "running"]:
+                logger.warning(f"Step 6 - Instance going down, skipping: {state}")
+                continue
+
+            # Step 7 - get AZ config from SSM
+            azConfig = config["az_config"][az]
+            logger.info(f"Step 7 - AZ config: {json.dumps(azConfig)}")
+
+            # Step 7a - release all static IPs before creating CFN stack
+            # this ensures no IP conflicts when CFN creates ENIs
+            # handles retained ENIs from previous instances
+            logger.info("Step 7a - Releasing all static IPs before CFN stack creation")
+            release_all_ips(config, az)
+            logger.info("Step 7a - All static IPs released successfully")
+
+            # eth0 mgmt static IP handled by Terraform pre-created ENI
+            # no Lambda action needed for eth0
+            logger.info(f"Step 7b - eth0 mgmt static IP handled by Terraform")
+
+            # Step 8 - build CFN resources for eth1 eth2 eth3
+            logger.info("Step 8 - Building CFN resources for eth1 eth2 eth3")
+            resources = {}
+            for device, eni in enumerate(config["eni_config"]):
+                logger.info(f"Step 8 - Building resources for device {device}")
+                resources = resources | eniToResources(azConfig, az, device, eni, instanceId)
+                logger.info(f"Step 8 - Resources so far: {json.dumps(resources)}")
+
+            # Step 9 - build final CFN template
+            try:
+                templateBody = json.dumps(templateBase | {"Resources": resources})
+                logger.info(f"Step 9 - Template Body: {templateBody}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Step 9 - Invalid template JSON: {str(e)}")
+                raise
+
+            # Step 10 - create CloudFormation stack
+            try:
+                response = cloudformation.create_stack(
+                    StackName=f"{name}-{instanceId}",
+                    TemplateBody=templateBody,
+                    ClientRequestToken=data["LifecycleActionToken"],
+                    Tags=[
+                        {"Key": "LifecycleActionToken", "Value": data["LifecycleActionToken"]},
+                        {"Key": "AsgName",               "Value": data["AutoScalingGroupName"]},
+                        {"Key": "HookName",              "Value": data["LifecycleHookName"]},
+                        {"Key": "InstanceId",            "Value": instanceId},
+                        {"Key": "f5_cloud_failover_env", "Value": env},
+                    ],
+                )
+                logger.info(f"Step 10 - CFN stack created successfully: {response['StackId']}")
+            except Exception as e:
+                logger.error(f"Step 10 - Failed to create CFN Stack: {str(e)}")
+                logger.error(f"Step 10 - Template body: {templateBody}")
+                raise
+
+        except Exception as e:
+            logger.error(f"Failed to process record: {str(e)}")
+            raise
+
+    logger.info("******** Lambda handler completed successfully **********")
+
+
+if __name__ == "__main__":
+    event = {
+        "Records": [{
+            "body": json.dumps({
+                "detail": {
+                    "Origin": "EC2",
+                    "LifecycleHookName": "attach-enis",
+                    "Destination": "AutoScalingGroup",
+                    "AccountId": "058264473556",
+                    "RequestId": "8ac64412-9858-e2b4-66ee-303f1d5f6b6c",
+                    "LifecycleTransition": "autoscaling:EC2_INSTANCE_LAUNCHING",
+                    "AutoScalingGroupName": "hh-test-hook",
+                    "Service": "AWS Auto Scaling",
+                    "Time": "2024-07-30T17:18:16.891Z",
+                    "EC2InstanceId": "i-04b1a13aea847ad83",
+                    "NotificationMetadata": {"sgs": ["sg-0748d2aa5d418ea71"]},
+                    "LifecycleActionToken": "04fea619-717f-4a70-9e52-52d1d2bfb3ee",
+                },
+            }),
+        }],
+    }
+    handler(event, {})
