@@ -1,0 +1,696 @@
+#Import Helpers
+
+import pandas as pd
+from pyspark.sql import functions as f, Window
+from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+from functools import reduce
+from itertools import chain
+
+from databricks_fins.spark import overwrite_delta_table
+from databricks_fins.fleet import join_adem_installation_meta
+from airport_severity import Region
+
+spark.conf.set("spark.sql.shuffle.partitions", 10000)
+spark.conf.set("spark.sql.adaptive.enabled", False)
+
+-------------------------------------------------------------------------------------------------
+# Establish Parameter Lists
+
+meta_columns = [
+    'flight_id',
+    'acq_date_time',
+    'aircraft_type',
+    'engine_family',
+    'esn',
+    'engine_position',
+    'operator',
+    'tail_id',
+    'thrust_rating',
+    'departure_airport_iata',
+    'departure_airport_icao',
+    'destination_airport_iata',
+    'destination_airport_icao',
+    'takeoff_severity_region',
+    'takeoff_severity_country',
+]
+
+config_columns = [
+    'nameplate',
+    'combustor_block',
+    'combustor_sn',
+    'first_blade',
+    'first_blade_sn',
+    'first_vane',
+    'first_vane_sn',
+]
+
+analytic_averages = [
+    'operating_duration',
+    'flight_duration',
+    'takeoff_severity_severity',
+    'takeoff_eslatt',
+    'takeoff_sat',
+    'takeoff_altitude',
+    'takeoff_aircraft_gross_weight',
+    'takeoff_derate',
+    'climb_derate',
+    'cruise_aircraft_gross_weight',
+    'cruise_mn',
+    'peak_cruise_altitude',
+]
+
+custom_agg_analytics = [
+    "climb_derate"
+]
+
+output_columns = (
+    meta_columns
+    + config_columns
+    + analytic_averages
+    + custom_agg_analytics
+)
+
+year = f.year(f.col('acq_date_time')).alias('year')
+month = f.month(f.col('acq_date_time')).alias('month')
+
+climb_derate_conditions = {
+    'climb_derate': {
+        'A220': f.col('climb_derate') > 0,
+        'E2': f.col('climb_derate') > 0
+    },
+    'climb_derate1': {
+        'A220': f.col('climb_derate') == 5,
+        'E2': f.col('climb_derate') == 0
+    },
+    'climb_derate2': {
+        'A220': f.col('climb_derate') == 10,
+        'E2': f.col('climb_derate') == 5
+    }
+}
+
+fleet_distinct_count_columns = {
+    'esn': 'esn_count',
+    'tail_id': 'ac_count'
+}
+
+-------------------------------------------------------------------------------------------------
+
+#Establish Aggregation Configurations
+
+env = str(dbutils.widgets.get("env")).lower()
+assert env in ("sandbox", "dev", "qa", "prod"), "Inappropriate env specified"
+
+gap_filled = str(dbutils.widgets.get("gap_filled")) == "True"
+deprecated_tables = str(dbutils.widgets.get("deprecated_tables")) == "True"  # TODO remove
+source_table = (  # TODO remove prefix
+    f"see_{env}.{'deprecated_' * deprecated_tables}flight_operational_parameters{'_gap_filled' * gap_filled}"
+)
+
+configurations = {
+    "esn": {
+        "table": "monthly_esn_operation",
+        "group_keys": [
+            'operator',
+            'cust_id',
+            'engine_family',
+            'aircraft_type',
+            'tail_id',
+            'thrust_rating',
+            'esn',
+        ],
+    },
+    "fleet": {
+        "table": "monthly_fleet_operation",
+        "group_keys": [
+            'operator',
+            'cust_id',
+            'engine_family',
+            'aircraft_type',
+            'thrust_rating',
+        ],
+    },
+    "esn_city_pair": {
+        "table": "monthly_esn_city_pair_operation",
+        "group_keys": [
+            'esn',
+            'aircraft_type',
+            'thrust_rating',
+            'departure_airport_iata',
+            'destination_airport_iata',
+        ],
+    },
+    "operator_city_pair": {
+        "table": "monthly_fleet_city_pair_operation",
+        "group_keys": [
+            'operator',
+            'cust_id',
+            'engine_family',
+            'aircraft_type',
+            'thrust_rating',
+            'departure_airport_iata',
+            'destination_airport_iata',
+        ],
+    },
+    "hse_esn": {
+        "table": "monthly_esn_operation",
+        "group_keys": [
+            'operator',
+            'cust_id',
+            'engine_family',
+            'aircraft_type',
+            'tail_id',
+            'coalesced_nameplate',
+            'esn',
+        ],
+    },
+}
+
+configuration = str(dbutils.widgets.get("config")).lower()
+try:
+    config = configurations[configuration]
+except KeyError:
+    raise ValueError("Inappropriate config specified")
+
+table_name = f"{config['table']}{'_gap_filled' * gap_filled}"
+
+meta_keys = config['group_keys']
+group_keys = ['month', *meta_keys]
+
+year_over_year = str(dbutils.widgets.get("year_over_year")) == "True"
+if year_over_year:
+    table_name = f"year_over_year_{table_name}"
+else:
+    group_keys.append('year')
+
+if deprecated_tables:  # TODO remove this branch
+    output_table = f"see_{env}.deprecated_{table_name}"
+elif env == 'prod':
+    output_table = (
+        "delta.`abfss://data@p16p1dbrpwxstaa.dfs.core.usgovcloudapi.net"
+        f"/see_prod.db/{table_name}`"
+    )
+else:
+    output_table = f"see_{env}.{table_name}"
+
+print(output_table, group_keys)
+
+-------------------------------------------------------------------------------------------------
+
+#Read Flight Operational Parameters
+
+engine_configuration = spark.table("fins.engine_configurations")
+
+src_table = spark.table(
+    source_table
+).filter(
+    "flight_cycle = TRUE"
+).filter(
+    "esn >= 735920 and esn <= 802999"
+)
+
+select_cols = list(set(src_table.columns) & set(output_columns))
+src_table = src_table.select(select_cols)
+
+table = join_adem_installation_meta(
+    src_table,
+    esn_field='esn',
+    timestamp_field='acq_date_time',
+    adem_meta=engine_configuration,
+).dropDuplicates([
+    "esn",
+    "flight_id",
+]).withColumn(
+    'year', year,
+).withColumn(
+    'month', month,
+).withColumn(
+    "coalesced_nameplate",
+    f.coalesce("nameplate", "thrust_rating")
+).persist()
+# display(table)
+
+----------------------------------------------------------------------------------------
+#Load Hawkeye Cycles and Hours
+
+
+hawkeye_table = spark.table(
+    'delta.`abfss://data@p16p1dbrpwxstaa.dfs.core.usgovcloudapi.net/dphm_hwk_scratch.db/flight_hours_cycles`',
+)
+
+hw_table = join_adem_installation_meta(
+    hawkeye_table,
+    esn_field='esn',
+    timestamp_field='Period_Start_Datetime',
+    adem_meta=engine_configuration,
+).withColumnRenamed(
+    "period_year",
+    "year",
+).withColumnRenamed(
+    "period_month",
+    "month",
+)
+
+hawkeye_group_keys = ["month", *(set(meta_keys) & set(hw_table.columns))]
+if not year_over_year:
+    hawkeye_group_keys.append('year')
+
+hawkeye_hrs = hw_table.groupby(
+    hawkeye_group_keys,
+).agg(
+    (hr := f.sum("period_hours").alias("hawkeye_monthly_utilization")),
+    (cyc := f.sum("period_cycles").alias("hawkeye_monthly_flight_count")),
+    (hr / cyc).alias("hawkeye_flight_duration"),
+)
+
+# display(hawkeye_hrs)
+
+-----------------------------------------------------------------
+# Aggregate Operational Metrics
+
+valid_goups = " AND ".join([
+    f"{key} is not null"
+    for key in group_keys
+])
+
+null_derate_count = f.count_if(f.col("climb_derate").isNotNull())
+
+climb_derate_totals_calculations = {
+    derate_type: (
+        f.count_if(reduce(lambda a, b: a | b, [
+            f.col("aircraft_type").like(f"%{ac_type}%") & condition
+            for ac_type, condition in aircraft_types.items()
+        ]))
+    )
+    for derate_type, aircraft_types in climb_derate_conditions.items()
+}
+
+# Fixed 37000 (35000 for A321Neo) altitude value to be replaced with contract values when
+# we bring that data in to Databricks
+peak_cruise_threshold = f.when(f.col("aircraft_type") == "A321Neo", 35000).otherwise(37000)
+
+ae_metrics = table.filter(valid_goups)
+
+if configuration == 'fleet':
+    ae_metrics = ae_metrics.withColumn('months_total', (f.col('year') * 12) + f.col('month'))
+    # Partition ranges can only be over a single parameter
+    w = Window.partitionBy(meta_keys).orderBy(f.col('months_total')).rangeBetween(-11, 0)
+    for input_field, output_field in fleet_distinct_count_columns.items():
+        ae_metrics = ae_metrics.withColumn(
+            f"annual_{output_field}", f.size(f.collect_set(input_field).over(w)),
+        )
+
+ae_metrics = (
+    ae_metrics
+    .groupby(group_keys)
+    .agg(
+        f.max("icao").alias("icao"),
+        f.sum("flight_duration").alias("dphm_monthly_utilization"),
+        *(
+            column
+            for field in analytic_averages
+            for col in [f.col(field)]
+            for column in [
+                f.mean(col).cast("decimal(26, 20)").alias(field),
+                f.sum(col.isNotNull().cast("int")).alias(f"{field}_count"),
+            ]
+        ),
+        (
+            f.count_if(f.col("peak_cruise_altitude") > peak_cruise_threshold)
+            / f.sum(f.col("peak_cruise_altitude").isNotNull().cast("int"))
+        ).alias("peak_cruise_altitude_perc"),
+        *(
+            column
+            for derate_type, total in climb_derate_totals_calculations.items()
+            for column in [
+                f.try_divide(total, null_derate_count).cast("decimal(21, 20)").alias(f"{derate_type}_is_set_perc"),
+                total.cast("int").alias(f"{derate_type}_set_perc_count")
+            ]
+        ),
+        *chain.from_iterable(
+            (
+                f.count_distinct(input_field).cast("int").alias(f"monthly_{output_field}"),
+                f.any_value(f.col(f"annual_{output_field}")).cast("int").alias(f"annual_{output_field}"),
+            )
+            for input_field, output_field in fleet_distinct_count_columns.items()
+            if configuration == "fleet"
+        ),
+        *(
+            f.sum(
+                (f.col("takeoff_severity_region") == region.name).cast("int")
+            ).alias(region.name)
+            for region in Region
+        ),
+        *(
+            f.collect_set(f.col(field)).alias(field)
+            for field in config_columns
+        ),
+        f.count("*").alias("monthly_flight_count"),
+    )
+).withColumnRenamed(
+    "flight_duration",
+    "dphm_flight_duration",
+).withColumnRenamed(
+    "flight_duration_count",
+    "dphm_flight_duration_count",
+)
+
+# display(ae_metrics)
+
+-----------------------------------------
+
+#Join AE Metrics with Hawkeye Monthly Hours
+
+metrics_cols = set(ae_metrics.columns)
+hawkeye_cols = set(hawkeye_hrs.columns)
+
+monthly_metrics = ae_metrics.join(
+    hawkeye_hrs,
+    [
+        getattr(ae_metrics, key) == getattr(hawkeye_hrs, key)
+        for key in metrics_cols & hawkeye_cols & set(group_keys)
+    ],
+    how='left',
+).select(
+    *(getattr(ae_metrics, col) for col in ae_metrics.columns),
+    *sorted(hawkeye_cols - metrics_cols)
+).withColumn(
+    "monthly_utilization",
+    f.when(
+        hawkeye_hrs.hawkeye_monthly_utilization == 0,
+        ae_metrics.dphm_monthly_utilization,
+    ).otherwise(
+        f.coalesce(
+            hawkeye_hrs.hawkeye_monthly_utilization,
+            ae_metrics.dphm_monthly_utilization,
+        ),
+    ),
+).withColumn(
+    "flight_duration",
+    (
+        flt_duration := f.when(
+            hawkeye_hrs.hawkeye_flight_duration == 0,
+            ae_metrics.dphm_flight_duration,
+        ).otherwise(
+            f.coalesce(
+                hawkeye_hrs.hawkeye_flight_duration,
+                ae_metrics.dphm_flight_duration,
+            ),
+        )
+    ),
+).withColumn(
+    "flight_duration_count",
+    f.when(
+        hawkeye_hrs.hawkeye_flight_duration == flt_duration,
+        hawkeye_hrs.hawkeye_monthly_flight_count,
+    ).otherwise(
+        ae_metrics.dphm_flight_duration_count,
+    ),
+)
+
+# display(monthly_metrics)
+
+-----------------------------------------------------
+#Evaluate Monthly Utilization
+
+annual_avg_parms = ['takeoff_eslatt', 'takeoff_derate', 'flight_duration']
+annual_avg_counts = [f"{p}_count" for p in annual_avg_parms]
+annual_avgs = [f"annual_avg_{p}" for p in annual_avg_parms]
+
+
+def evaluate_annual_utilization(df: pd.DataFrame) -> pd.DataFrame:
+    df.sort_values(['year', 'month'], inplace=True)
+    df.index = map(datetime, df['year'], df['month'], [1] * df.size)
+    df['annual_utilization'] = df['monthly_utilization'].rolling(
+        window='365D',
+    ).sum()
+
+    averages = df[annual_avg_parms].fillna(0).values
+    param_counts = df[annual_avg_counts].fillna(0)
+
+    monthly_total = pd.DataFrame(
+        averages * param_counts.values,
+        columns=annual_avg_counts,
+        index=df.index,
+    )
+    weighted_sum = rolling_sum(monthly_total)
+    df[annual_avgs] = weighted_sum / rolling_sum(param_counts)
+
+    if configuration == 'fleet':
+        apply_monthly = df['monthly_utilization'].rolling(window='365D').apply
+        # With zero: sum the monthly utilization aggregation and divide by the number of unique (ac/esn)s in that trailing year
+        df['annual_ac_utilization_with_zero'] = apply_monthly(
+            lambda x: x.sum() / df.loc[x.index[-1], 'annual_ac_count'] / 2 * 12 / len(x)
+        )
+        df['annual_esn_utilization_with_zero'] = apply_monthly(
+            lambda x: x.sum() / df.loc[x.index[-1], 'annual_esn_count'] * 12 / len(x)
+        )
+        # Without zero: divide the monthly utilization aggregation by the number of unique (ac/esn)s in that month, to get utilization per esn per month.
+        # Then sum over all the months
+        df['annual_ac_utilization_without_zero'] = apply_monthly(
+            lambda x: x.sum() / df.loc[x.index, 'monthly_ac_count'].sum() * 12 / 2 * 12 / len(x)
+        )
+        df['annual_esn_utilization_without_zero'] = apply_monthly(
+            lambda x: x.sum() / df.loc[x.index, 'monthly_esn_count'].sum() * 12 * 12 / len(x)
+        )
+        # For all of these, multiply by `12 / number of months in rolling window`, to normalize the windows where <1yr of data is present.
+
+    return df
+
+
+def rolling_sum(df: pd.DataFrame) -> pd.DataFrame:
+    return df.rolling(window='365D').sum()
+
+
+operational_metrics = monthly_metrics.withColumn(
+    "annual_utilization",
+    f.col('monthly_utilization'),
+).withColumn(
+    "annual_avg_takeoff_eslatt",
+    f.col('takeoff_eslatt').cast("float"),
+).withColumn(
+    "annual_avg_takeoff_derate",
+    f.col('takeoff_derate').cast("float"),
+).withColumn(
+    "annual_avg_flight_duration",
+    f.col('flight_duration').cast("float"),
+)
+if configuration == 'fleet':
+    operational_metrics = operational_metrics.withColumn(
+        "annual_ac_utilization_with_zero",
+        f.col('monthly_utilization').cast("float"),
+    ).withColumn(
+        "annual_esn_utilization_with_zero",
+        f.col('monthly_utilization').cast("float"),
+    ).withColumn(
+        "annual_ac_utilization_without_zero",
+        f.col('monthly_utilization').cast("float"),
+    ).withColumn(
+        "annual_esn_utilization_without_zero",
+        f.col('monthly_utilization').cast("float"),
+    )
+
+if not year_over_year:
+    operational_metrics = (
+        monthly_metrics
+        .groupby(meta_keys)
+        .applyInPandas(
+            evaluate_annual_utilization,
+
+            # It's super annoying to manually define the expected
+            # schema so below we use a temporary view of the
+            # new table with a mock `annual_utilization` column
+            # filled with dummy variables so we can just steal
+            # the schema
+            schema=operational_metrics.schema,
+        )
+    )
+
+# display(operational_metrics)
+---------------------------------------------------------------
+# Count Takeoff Countries
+
+# TODO: Check if HSE needs this calculation, otherwise it will be removed once SEE cuts over to using the new takeoff airport count column
+
+country = "takeoff_severity_country"
+country_group = [*group_keys, country]
+valid_goups = " AND ".join([
+    f"{key} is not null"
+    for key in country_group
+])
+
+counts = (
+    table
+    .replace("Azerbiajan", "Azerbaijan", subset = ["takeoff_severity_country"])
+    .filter(valid_goups)
+    .groupby(country_group)
+    .agg(
+        f.count(country).alias("count")
+    )
+)
+
+count = f.col("count")
+
+country_counts = (
+    counts
+    .groupBy(group_keys)
+    .agg(
+        f.sum(count).alias("severity_flight_count"), 
+        f.map_from_entries(
+            f.collect_list(
+                f.struct(
+                    f.col(country),
+                    count,
+                )
+            )
+        ).alias("takeoff_countries"),
+    )
+)
+
+# display(country_counts)
+
+----------------------------------------------------------
+#Count Takeoff Airports
+
+airport = "departure_airport"
+airport_group = [*group_keys, airport]
+valid_goups = " AND ".join([
+    f"{key} is not null"
+    for key in airport_group
+])
+
+airport_counts = (
+    table
+    .withColumn("departure_airport", f.when(f.col("departure_airport_icao").rlike(r"^[A-Z]{4}$"), f.col("departure_airport_icao")).otherwise(f.col("departure_airport_iata")))
+    .filter(valid_goups)
+    .groupby(airport_group)
+    .agg(
+        f.count(airport).alias("count")
+    )
+)
+
+count = f.col("count")
+
+dept_airport_counts = (
+    airport_counts
+    .groupBy(group_keys)
+    .agg(
+        f.map_from_entries(
+            f.collect_list(
+                f.struct(
+                    f.col(airport),
+                    count,
+                )
+            )
+        ).alias("takeoff_airports"),
+    )
+)
+
+# display(dept_airport_counts)
+
+---------------------------------------------------------
+
+#Join Country Count and Metrics
+
+metrics_cols = set(operational_metrics.columns)
+country_cols = set(country_counts.columns)
+airport_cols = set(dept_airport_counts.columns)
+
+results = operational_metrics.join(
+    country_counts,
+    group_keys,
+    how='left',
+).join(
+    dept_airport_counts,
+    group_keys,
+    how='left'
+).select(
+    *(getattr(operational_metrics, col) for col in operational_metrics.columns),
+    *sorted((country_cols | airport_cols) - metrics_cols)
+)
+
+# display(results)
+
+----------------------------------------------------
+
+#Max Cruise Alt Bucket Counts
+
+bucket_size = 1000
+max_cruise_column_name = "max_cruise_alt_bucket"
+location_column_name = "dept|dest"
+
+floored_cruise_alts = (
+  table
+  .filter(f.col("peak_cruise_altitude").isNotNull())
+  .withColumn(max_cruise_column_name, f.floor(f.col("peak_cruise_altitude")/bucket_size) * bucket_size)
+  .withColumn(location_column_name, f.concat_ws("|", f.col("departure_airport_icao"), f.col("destination_airport_icao")))
+)
+
+aggregated_cruise_alts = (
+  floored_cruise_alts
+  .groupBy([*group_keys, max_cruise_column_name, location_column_name])
+  .agg(
+    f.count(max_cruise_column_name).alias("count")
+  )
+)
+
+bucketed_location_cruise_alts = (
+  aggregated_cruise_alts
+  .groupBy([*group_keys, max_cruise_column_name])
+  .agg(
+    f.struct(
+      f.sum("count").alias("count"),
+      f.map_from_entries(
+        f.collect_list(f.when(f.col(location_column_name) != "", f.struct(location_column_name, f.when(f.lit(True), count))))
+      ).alias("count_by_location")
+    ).alias("cruise_alt_counts")
+  )
+)
+
+bucketed_cruise_alts = (
+  bucketed_location_cruise_alts
+  .groupBy(group_keys)
+  .agg(
+    f.map_from_entries(f.collect_list(f.struct(max_cruise_column_name, "cruise_alt_counts"))).alias("cruise_alt_counts")
+  )
+)
+
+# display(bucketed_cruise_alts)
+--------------------------------------------------------------
+
+#Join Max Cruise Alts and Metric
+
+results_cols = set(results.columns)
+alt_cols = set(bucketed_cruise_alts.columns)
+
+results = results.join(
+    bucketed_cruise_alts,
+    [
+        getattr(results, key) == getattr(bucketed_cruise_alts, key)
+        for key in group_keys
+    ],
+    how='left',
+).select(
+    *(getattr(results, col) for col in results.columns),
+    *sorted(alt_cols - results_cols)
+)
+
+# display(results)
+
+-----------------------------------------
+
+#Write to an Output Location
+
+overwrite_delta_table(results, name=output_table)
+
+----------------------------------------------
+
+#Optimize Disk Storage
+
+keys = sorted(set(group_keys) & {"cust_id", "thrust_rating", "esn"})
+if year_over_year:
+    keys = ['month', *keys]
+else:
+    keys = ['year', 'month', *keys]
+spark.sql(f"OPTIMIZE {output_table} ZORDER BY {', '.join(keys)}")
+
+-----------------------
