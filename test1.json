@@ -1,9 +1,199 @@
-How if I have more than  30 EIPs for c5n.4xlarge and larger what approach we have ?
+Once one ENI is full, you have two broad paths: add more IP capacity or use fewer public IPs. In practice, many large deployments combine both.
 
-Searched the web
+1. Add more external ENIs to BIG-IP
+
+The 30-per-ENI limit applies to each interface, not to the whole instance. A c5n.4xlarge supports up to 8 ENIs. You could keep 1 for management and 1 for internal traffic, and use the remaining ENIs as additional external interfaces, each holding up to 30 EIPs.
+
+Put each extra external ENI in its own subnet, and give it its own VLAN and self IP on BIG-IP. BIG-IP doesn't handle two interfaces in the same subnet well.
+Every extra ENI uses one of its private IPs for the self IP, so you get 29 usable VIP addresses per ENI instead of 30.
+ENIs are attached when the instance is stopped, and BIG-IP must be restarted to see a new NIC. Plan this for a maintenance window.
+Larger sizes give more room. For example, I believe c5n.18xlarge supports 15 ENIs with 50 IPs each. Check the exact figures with the CLI command from before, since limits vary by type and size.
+2. Consolidate VIPs so you need fewer EIPs
+
+This is often the better long-term fix.
+
+Host and SNI-based routing: put many HTTPS apps behind one EIP on port 443. An LTM policy or iRule then routes each request to the right pool based on the Host header or SNI. This can reduce dozens of EIPs to one or a few.
+Port-based VIPs: for non-HTTP services, run several virtual servers on the same IP with different ports.
+3. Put an AWS NLB in front of BIG-IP
+
+Each NLB gets one static EIP per availability zone and forwards traffic to BIG-IP self IPs or VIPs as targets.
+
+Several NLBs can front one BIG-IP, so public IPs are no longer tied to BIG-IP ENI limits.
+You get NLB-level scaling across AZs, and BIG-IP HA often becomes simpler because the NLB health checks the targets instead of remapping EIPs on failover.
+The drawbacks are that you pay for each NLB, and client source IPs are preserved only in certain target modes (or with Proxy Protocol).
+4. Scale out horizontally
+
+Deploy more BIG-IP pairs or an autoscaled group. Split applications across them, with each pair owning its own set of EIPs.
+
+Things to watch at this scale
+EIP quota: the default is 5 per region, so raise it through Service Quotas before you build.
+Failover time in HA: if you use the F5 Cloud Failover Extension (CFE) to remap EIPs across AZs, each EIP is a separate AWS API call during failover. With 50–100+ EIPs, failover gets noticeably slower. This is a strong reason to prefer consolidation (option 2) or an NLB (option 3) over simply adding ENIs.
+Internal-only apps: these don't need EIPs at all. You can route a VIP range that sits outside the VPC CIDR to the BIG-IP ENI through VPC route tables, which avoids both the IP limits and the EIP quota.
+
+A common layout is two or three external ENIs, plus SNI/host-based consolidation for web apps, with an NLB for anything that needs a very large number of distinct public IPs.
+
+
+Add a fifth ENI as a second external interface (External-2). Your c5n.4xlarge supports up to 8 ENIs and you use 4, so you have room for up to 4 more. Each new external ENI gives you 29 more EIPs, because one private IP goes to its self IP.
+
+Steps
+
+1. Create a new public subnet in AWS
+
+It must be in the same availability zone as the BIG-IP instance. An ENI can only attach to an instance in its own AZ.
+Use a CIDR that doesn't overlap your existing ones, for example: External-1 is 10.0.1.0/24 and External-2 is 10.0.5.0/24.
+Associate a route table that has 0.0.0.0/0 → Internet Gateway, the same as External-1.
+
+2. Create the ENI
+
+Create it in the new subnet, with the same security group as External-1 (or one allowing your VIP ports).
+Disable source/destination check on it, as on your other data-plane ENIs.
+Add secondary private IPs, up to 29 of them.
+
+3. Attach the ENI to the instance
+
+Stop the BIG-IP instance, attach the ENI as device index 4, then start it. BIG-IP only detects new NICs at boot, so plan a maintenance window. With HA, do the standby first, then fail over and do the other unit.
+After boot, it should appear in BIG-IP as interface 1.4. Check with tmsh show net interface.
+
+4. Configure BIG-IP
+
+Create VLAN external2, untagged on interface 1.4.
+Create a self IP on it using the ENI's primary private IP.
+Create virtual servers on the ENI's secondary private IPs.
+
+5. Allocate and associate EIPs
+
+Associate one EIP with each secondary private IP on the new ENI.
+Check that your EIP quota in Service Quotas covers the new total. You're already past 30, so you'll need about 60 or more.
+Routing: keep traffic symmetric
+
+BIG-IP has a single default route, probably via the External-1 gateway. Replies to traffic that came in on External-2 must go back out External-2, or AWS will drop them.
+
+Auto Last Hop handles this. It's enabled by default on the VLAN and virtual server, so leave it on.
+If BIG-IP makes outbound connections from External-2 addresses (SNAT pools, health monitors to public destinations), add a specific route or a route domain for that traffic.
+If you run HA with Cloud Failover Extension (CFE)
+Tag the new ENI with the same f5_cloud_failover_label and NIC mapping tags as External-1.
+Update the CFE declaration so the new ENI's secondary IPs and EIPs are remapped on failover.
+Build the matching External-2 ENI and subnet for the peer unit in the other AZ.
+Test failover. With about 60 EIPs to remap, failover will take noticeably longer than before.
+Longer-term
+
+If you expect to keep growing, adding ENIs only buys time: at most about 4 × 29 more EIPs on this instance type, with slower failover each time. To grow further, consolidate web apps behind fewer VIPs with SNI or host-based routing (one EIP on port 443 can serve many apps), or place an NLB in front for services that truly need distinct public IPs.
+
+Adding a fifth ENI is a normal, supported change, and on BIG-IP it's usually uneventful. These are the things that do cause problems, roughly in order of how often they cause trouble.
+
+Most likely to cause problems
+
+1. Interface order after reboot
+BIG-IP VE detects NICs only at boot. Because you attach the new ENI at device index 4, existing interfaces should keep their numbers (1.1, 1.2, 1.3) and the new one becomes 1.4. Still, verify this after boot rather than assuming it: compare the MACs from tmsh show net interface all-properties with the ENI MACs in the EC2 console. If an existing interface moved, its VLAN would point at the wrong ENI, and traffic on External, Sterling or Internal would break.
+
+2. Asymmetric routing
+This is the most common real problem. BIG-IP has one default gateway, probably via External-1. Replies for traffic that arrived on External-2 must leave through External-2, or AWS drops them.
+
+Auto Last Hop handles this for inbound VIP traffic. It's on by default, so check that it hasn't been disabled on the new VLAN or on your virtual servers.
+Outbound connections that BIG-IP starts itself don't benefit from Auto Last Hop. This includes health monitors to public targets, SNAT pools using External-2 addresses, and NTP or DNS going out that side. They follow the routing table, so add specific routes, or use a route domain for External-2 if it needs its own default gateway.
+
+3. Declarative Onboarding (DO) or other automation overwriting the change
+If the unit was built with F5 Declarative Onboarding, Terraform or cloud-init, update that source too. Otherwise the next time a DO declaration is re-applied, it can remove the external2 VLAN and self IP you added by hand.
+
+HA / Cloud Failover Extension (if you run a pair)
+
+4. Configuration on both units
+Both units need an external2 VLAN, each with its own self IP from its own subnet in its own AZ. VLANs and self IPs are local to each device and don't come over through config sync, so create them on each unit.
+
+5. CFE must know about the new ENI
+Tag the new ENIs with the same f5_cloud_failover_label and NIC tags you used on External-1. Then update the CFE declaration. Otherwise the new EIPs won't move on failover and those VIPs go dark on the standby.
+
+6. Longer failover time
+CFE remaps EIPs with AWS API calls, so going from about 30 to about 60 EIPs means more calls. Test failover and measure the actual time, and watch for AWS API throttling.
+
+Worth checking, rarely a problem
+Platform support: confirm your BIG-IP version is supported on c5n (ENA driver) with 5 or more NICs. Check the BIG-IP VE supported platforms matrix for your exact version; recent 15.1.x, 16.1.x and 17.x releases are generally fine.
+Throughput: a new ENI adds IP addresses, not bandwidth. The instance's network cap and your BIG-IP VE license throughput limit stay the same, so if both externals are busy they share it.
+MTU: keep the new VLAN at 1500 for internet-facing traffic. Jumbo frames (9001) only work inside the VPC.
+Self IP port lockdown: set the External-2 self IP to Allow None (or only what's needed), just like External-1. It's internet-facing.
+AWS side: turn off source/destination check on the new ENI, attach a security group that allows your VIP ports, and point the subnet's route table at the IGW.
+Downtime: the instance must stop and start. With HA, do the standby first, fail over, then do the other unit.
+Suggested validation after the change
+Check that tmsh show net interface shows 1.1–1.4 up, with MACs matching the ENIs.
+Confirm existing VIPs on External, Sterling and Internal still work. This catches any renumbering problem right away.
+Test a VIP on External-2 from the internet. Also capture traffic with tcpdump -ni external2 to confirm replies leave through External-2.
+Force a failover and confirm that EIPs from both External-1 and External-2 move to the peer.
+
+In short, there's no BIG-IP limitation stopping you. The real risks are routing symmetry, automation overwriting the change, and CFE not being updated. Everything else is a routine check
+
+
+Most of these risks are avoided by doing the change in the right order and keeping the design simple. Here's what I'd suggest for each one, and then my overall recommendation.
+
+1. Interface order: attach at the end and verify before going live
+Attach the new ENI at device index 4, and never insert it between existing ones.
+Before the change, record MAC-to-interface mappings:
+  tmsh show net interface all-properties
+After the reboot, compare against the EC2 console (Network Interfaces → MAC). If anything shifted, fix the VLAN-to-interface mapping before putting the unit back in service. Doing the standby unit first protects you here.
+2. Asymmetric routing: rely on Auto Last Hop and avoid complexity
+
+For inbound VIP traffic, Auto Last Hop solves it. Make sure it's on:
+
+tmsh list net vlan external2 auto-lasthop
+tmsh list ltm virtual <vs_name> auto-lasthop
+
+It should show default or enabled (the global default is enabled).
+
+To avoid the outbound problem, don't originate traffic from External-2:
+
+Put SNAT and SNAT automap on the internal side, toward pool members, as usual. Don't use External-2 addresses for SNAT.
+Health monitors go to pool members through Internal/Sterling, so they aren't affected.
+Keep the default route through External-1.
+
+Only if you do need BIG-IP to start connections out of External-2 should you add a specific static route for those destinations through the External-2 subnet gateway (the .1 address of the subnet). I would not introduce a separate route domain. It adds cross-route-domain complexity for little benefit.
+
+3. Automation overwriting the change: update the source first
+If you use Declarative Onboarding, add the external2 VLAN (interface 1.4) and its self IP to the DO declaration before the change, and apply it through DO rather than by hand.
+If you use Terraform or CloudFormation, add the subnet, ENI, secondary IPs and EIPs there too. Otherwise the next run may delete them.
+If everything is manual today, document the new VLAN and self IP in your build notes.
+4 and 5. HA and CFE: tag everything and update the declaration
+
+On each unit, create the VLAN and self IP locally (they don't sync):
+
+tmsh create net vlan external2 interfaces add { 1.4 }
+tmsh create net self external2-self address 10.0.5.10/24 vlan external2 allow-service none traffic-group traffic-group-local-only
+
+The peer uses its own subnet, for example 10.0.6.10/24 in the other AZ.
+
+For CFE:
+
+Apply the same f5_cloud_failover_label tag to the new ENIs and new EIPs as on External-1.
+For cross-AZ EIP failover, each EIP needs the f5_cloud_failover_vips tag, listing the matching secondary private IPs on both units (for example 10.0.5.20,10.0.6.20). Follow the exact tagging format in the CFE docs for your CFE version, since it has changed between releases.
+Upgrade to the latest CFE release if you're on an old one.
+Check the IAM role has ec2:AssociateAddress and ec2:DisassociateAddress (it should, since External-1 already fails over).
+6. Slower failover: measure it and plan for it
+Force a failover in the maintenance window and time it:
+  curl -su admin: http://localhost:8100/mgmt/shared/cloud-failover/trigger
+
+Then check the status with the same endpoint using GET.
+
+For about 60 EIPs, expect failover in the tens of seconds, not instant. If that's acceptable for your apps, you're done. If not, see the longer-term options below.
+Overall recommendation
+
+Short term (now): add External-2 using the steps above, with this change sequence:
+
+Update automation and CFE tags in advance.
+Do the standby unit first: stop it, attach the ENI, start it, verify MACs, create the VLAN and self IP.
+Fail over, then repeat on the other unit.
+Build the VIPs and EIPs on External-2, test from the internet, then test failover both directions.
+
+Long term: stop growing EIPs one-for-one with applications. Every added ENI makes failover slower and adds operational work. You can add at most 3 more ENIs on this instance, so this approach will run out.
+
+Consolidate HTTPS apps behind one or a few VIPs with SNI or host-based routing (an LTM policy on 443). This usually gives the biggest reduction, often turning dozens of EIPs into a handful.
+Front non-HTTP services that truly need unique public IPs with an AWS NLB. The NLB owns the public IPs and health-checks both BIG-IPs, so those IPs don't need to move on failover at all.
+
+If you tell me roughly how many of your 30 EIPs are HTTPS web apps and how many are other protocols, I can suggest how far consolidation would reduce your count.
+
+
+
 Yes. Beyond adding External-2, consolidation and an NLB, there are several other options. Some work well for BIG-IP and some don't.
 
 Options that work
+
 1. Move to an instance type with 50 IPs per ENI
 Some larger sizes allow 50 IPs per ENI instead of 30. From memory, c5n.18xlarge, c5.24xlarge and the larger m5 and c6in sizes are in this group. Check the exact figures with the CLI before choosing, because they vary by family and size:
 
@@ -11,23 +201,27 @@ aws ec2 describe-instance-types --filters Name=network-info.ipv4-addresses-per-i
   --query "InstanceTypes[].InstanceType"
 Pros: simplest change, with no new subnets or routing work. External-1 would go from 30 to 50.
 Cons: much higher cost, and your BIG-IP VE license throughput doesn't change. You're paying mostly for IP slots. Changing the instance type also requires a stop and start, plus re-checking interface mapping.
+
 2. AWS Global Accelerator, custom routing type
 A custom routing accelerator gives you 2 static anycast public IPs. It maps many listener ports on those IPs to different private IP:port destinations on your BIG-IP ENIs.
 
 Pros: no EIPs at all, so it removes both the per-ENI limit and the EIP quota. It also adds global edge acceleration and DDoS protection.
 Cons: clients reach apps by port, not by a unique IP. This works well if your apps can live on different ports. It doesn't fit if each app needs its own public IP on 443. Global Accelerator also has its own hourly and data transfer costs.
 A standard Global Accelerator can also front an NLB, which gives each app static anycast IPs without EIPs on BIG-IP.
+
 3. Gateway Load Balancer (GWLB) with BIG-IP as an inline appliance
 F5 supports running BIG-IP behind an AWS GWLB. The public IPs live on the applications' own NLBs, ALBs or instances, and VPC routing steers traffic through BIG-IP for inspection (usually Advanced WAF or AFM).
 
 Pros: BIG-IP no longer owns any public IPs, so the ENI limit stops mattering entirely. It scales out horizontally, and failover is handled by GWLB instead of CFE and EIP remapping.
 Cons: it's an architecture change. BIG-IP acts as a transparent security layer, and full LTM proxy features such as SSL offload and iRules on VIPs work differently. It fits best if BIG-IP's main job is WAF or firewall rather than load balancing.
+
 4. IPv6 for internet-facing VIPs
 Public IPv6 addresses are routable directly and need no EIPs. BIG-IP fully supports IPv6 VIPs, and you can also assign IPv6 prefixes to an ENI.
 
 Pros: very large address space with no EIP quota.
 Cons: only works for clients that have IPv6. In practice you'd still need IPv4 EIPs for most users, so this only helps alongside another option.
 Options that don't help (to save you time)
+
 IPv4 prefix delegation: AWS can assign a /28 block (16 addresses) to an ENI, but each prefix uses one of the 30 slots. This is useful for containers. However, you can associate one Elastic IP address with each private IPv4 address on the network interface, meaning individually assigned private IPs, and there is no EIP equivalent for a delegated prefix. So it gives more private IPs but not more public ones.
 
 VPC ingress routing or routing a public IP range to BIG-IP: traffic from the internet to a VPC still has to be translated from a public to a private address through an EIP at the Internet Gateway. Routing a range to the appliance helps internal-only VIPs, not public ones.
@@ -43,6 +237,7 @@ NLB in front	Yes	Medium	Apps need unique public IPs
 Global Accelerator (custom routing)	Yes	Medium	Port-based access is acceptable
 GWLB inline	Yes	High (redesign)	BIG-IP is mainly WAF/security
 Scale out more BIG-IP pairs	Yes	Medium–high	Very large or growing estate
+
 My suggestion for your setup: add External-2 now for immediate capacity. Then, over time, consolidate the HTTPS apps with SNI and move non-HTTP apps that need dedicated IPs to NLBs in front of BIG-IP. This gives you the most room to grow with the least cost, and it reduces the EIP failover load on CFE.
 
 Sources:
@@ -50,37 +245,3 @@ Sources:
 Elastic network interfaces – AWS EC2 User Guide
 Prefix delegation for EC2 network interfaces – AWS EC2 User Guide
 Associating public IPs with IPv4 prefix delegation – AWS re:Post
-can you please share some links from BIG-IP related to this issue ?
-
-Searched the web
-Here are the most useful F5 links for your case, grouped by topic.
-
-Instance sizing and per-ENI IP limits
-
-Choosing an Instance for F5 BIG-IP in AWS (DevCentral): explains how AWS IP-per-instance limits affect how many virtual servers BIG-IP can have, and why the public IP count can't exceed the private IPs assigned.
-F5 in AWS Part 2: Running BIG-IP in an EC2 VPC (DevCentral): the classic design of self IP on the primary private IP and one secondary IP plus EIP per virtual server.
-F5 in AWS Part 1: AWS Networking Basics (DevCentral): why each subnet needs its own ENI, and how ENI limits cap the networks BIG-IP can connect to.
-Adding interfaces and multi-NIC setup
-
-F5 clouddocs: Three-NIC BIG-IP VE on AWS: creating an ENI, attaching it, and adding secondary IPs for virtual servers. This is the same procedure you'd follow for External-2.
-F5 clouddocs: High Availability BIG-IP VE on AWS: adding an extra ENI and subnet to each instance in an HA pair.
-F5 BIG-IP VE on AWS: clouddocs index: the landing page for all F5 AWS docs, including supported instance types and templates.
-Cloud Failover Extension (EIP remapping with the new ENI)
-
-CFE user guide: AWS across availability zones: the key page for your change. It describes the f5_cloud_failover_label and f5_cloud_failover_vips tags, and shows that only EIPs on secondary IPs move during failover, not those on the primary (self IP).
-CFE user guide: AWS same availability zone: the same-AZ design plus example IAM permissions.
-CFE FAQ: notes that failover addresses in non-default route domains aren't supported. This is another reason to keep External-2 in route domain 0.
-CFE on GitHub (releases and issues): the latest RPMs and known issues.
-Alternative architectures
-
-BIG-IP integration with AWS Gateway Load Balancer (DevCentral): the GWLB option, where BIG-IP doesn't own the public IPs.
-BIG-IP SSLO in AWS: inbound L3 with GWLB (DevCentral): a practical GWLB lab. It notes BIG-IP must be version 16.1 or higher to support the Geneve encapsulation GWLB uses.
-AWS HA across AZs without EIPs (DevCentral): for internal-only apps, a design that uses route tables instead of EIPs, which frees up EIPs.
-F5 BIG-IP VE HA Partner Solution on AWS (AWS Quick Start): a reference CloudFormation deployment that uses CFE.
-Worth looking up in MyF5 (my.f5.com)
-I couldn't confirm exact article numbers, so search MyF5 for:
-
-"Auto Last Hop" for how BIG-IP returns traffic out the ingress VLAN, which is key for External-2 routing symmetry.
-"BIG-IP VE supported platforms" for maximum NICs and c5n/ENA support for your version.
-"BIG-IP VE add network interface AWS" for the reboot requirement and interface mapping after adding a NIC.
-
