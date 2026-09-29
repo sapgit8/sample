@@ -1,0 +1,86 @@
+How if I have more than  30 EIPs for c5n.4xlarge and larger what approach we have ?
+
+Searched the web
+Yes. Beyond adding External-2, consolidation and an NLB, there are several other options. Some work well for BIG-IP and some don't.
+
+Options that work
+1. Move to an instance type with 50 IPs per ENI
+Some larger sizes allow 50 IPs per ENI instead of 30. From memory, c5n.18xlarge, c5.24xlarge and the larger m5 and c6in sizes are in this group. Check the exact figures with the CLI before choosing, because they vary by family and size:
+
+aws ec2 describe-instance-types --filters Name=network-info.ipv4-addresses-per-interface,Values=50 \
+  --query "InstanceTypes[].InstanceType"
+Pros: simplest change, with no new subnets or routing work. External-1 would go from 30 to 50.
+Cons: much higher cost, and your BIG-IP VE license throughput doesn't change. You're paying mostly for IP slots. Changing the instance type also requires a stop and start, plus re-checking interface mapping.
+2. AWS Global Accelerator, custom routing type
+A custom routing accelerator gives you 2 static anycast public IPs. It maps many listener ports on those IPs to different private IP:port destinations on your BIG-IP ENIs.
+
+Pros: no EIPs at all, so it removes both the per-ENI limit and the EIP quota. It also adds global edge acceleration and DDoS protection.
+Cons: clients reach apps by port, not by a unique IP. This works well if your apps can live on different ports. It doesn't fit if each app needs its own public IP on 443. Global Accelerator also has its own hourly and data transfer costs.
+A standard Global Accelerator can also front an NLB, which gives each app static anycast IPs without EIPs on BIG-IP.
+3. Gateway Load Balancer (GWLB) with BIG-IP as an inline appliance
+F5 supports running BIG-IP behind an AWS GWLB. The public IPs live on the applications' own NLBs, ALBs or instances, and VPC routing steers traffic through BIG-IP for inspection (usually Advanced WAF or AFM).
+
+Pros: BIG-IP no longer owns any public IPs, so the ENI limit stops mattering entirely. It scales out horizontally, and failover is handled by GWLB instead of CFE and EIP remapping.
+Cons: it's an architecture change. BIG-IP acts as a transparent security layer, and full LTM proxy features such as SSL offload and iRules on VIPs work differently. It fits best if BIG-IP's main job is WAF or firewall rather than load balancing.
+4. IPv6 for internet-facing VIPs
+Public IPv6 addresses are routable directly and need no EIPs. BIG-IP fully supports IPv6 VIPs, and you can also assign IPv6 prefixes to an ENI.
+
+Pros: very large address space with no EIP quota.
+Cons: only works for clients that have IPv6. In practice you'd still need IPv4 EIPs for most users, so this only helps alongside another option.
+Options that don't help (to save you time)
+IPv4 prefix delegation: AWS can assign a /28 block (16 addresses) to an ENI, but each prefix uses one of the 30 slots. This is useful for containers. However, you can associate one Elastic IP address with each private IPv4 address on the network interface, meaning individually assigned private IPs, and there is no EIP equivalent for a delegated prefix. So it gives more private IPs but not more public ones.
+
+VPC ingress routing or routing a public IP range to BIG-IP: traffic from the internet to a VPC still has to be translated from a public to a private address through an EIP at the Internet Gateway. Routing a range to the appliance helps internal-only VIPs, not public ones.
+
+Asking AWS to raise the per-ENI limit: this is a fixed hardware and instance-type limit, not a Service Quota. Only the EIP count quota can be raised.
+
+Summary
+Option	Removes 30/ENI limit?	Effort	Best when
+Add External-2 ENI	Adds 29 more	Low	Need a few more EIPs soon
+Bigger instance (50/ENI)	Raises to 50	Low, high cost	Want no design change
+SNI/host consolidation	Reduces need	Medium	Many apps are HTTPS
+NLB in front	Yes	Medium	Apps need unique public IPs
+Global Accelerator (custom routing)	Yes	Medium	Port-based access is acceptable
+GWLB inline	Yes	High (redesign)	BIG-IP is mainly WAF/security
+Scale out more BIG-IP pairs	Yes	Medium–high	Very large or growing estate
+My suggestion for your setup: add External-2 now for immediate capacity. Then, over time, consolidate the HTTPS apps with SNI and move non-HTTP apps that need dedicated IPs to NLBs in front of BIG-IP. This gives you the most room to grow with the least cost, and it reduces the EIP failover load on CFE.
+
+Sources:
+
+Elastic network interfaces – AWS EC2 User Guide
+Prefix delegation for EC2 network interfaces – AWS EC2 User Guide
+Associating public IPs with IPv4 prefix delegation – AWS re:Post
+can you please share some links from BIG-IP related to this issue ?
+
+Searched the web
+Here are the most useful F5 links for your case, grouped by topic.
+
+Instance sizing and per-ENI IP limits
+
+Choosing an Instance for F5 BIG-IP in AWS (DevCentral): explains how AWS IP-per-instance limits affect how many virtual servers BIG-IP can have, and why the public IP count can't exceed the private IPs assigned.
+F5 in AWS Part 2: Running BIG-IP in an EC2 VPC (DevCentral): the classic design of self IP on the primary private IP and one secondary IP plus EIP per virtual server.
+F5 in AWS Part 1: AWS Networking Basics (DevCentral): why each subnet needs its own ENI, and how ENI limits cap the networks BIG-IP can connect to.
+Adding interfaces and multi-NIC setup
+
+F5 clouddocs: Three-NIC BIG-IP VE on AWS: creating an ENI, attaching it, and adding secondary IPs for virtual servers. This is the same procedure you'd follow for External-2.
+F5 clouddocs: High Availability BIG-IP VE on AWS: adding an extra ENI and subnet to each instance in an HA pair.
+F5 BIG-IP VE on AWS: clouddocs index: the landing page for all F5 AWS docs, including supported instance types and templates.
+Cloud Failover Extension (EIP remapping with the new ENI)
+
+CFE user guide: AWS across availability zones: the key page for your change. It describes the f5_cloud_failover_label and f5_cloud_failover_vips tags, and shows that only EIPs on secondary IPs move during failover, not those on the primary (self IP).
+CFE user guide: AWS same availability zone: the same-AZ design plus example IAM permissions.
+CFE FAQ: notes that failover addresses in non-default route domains aren't supported. This is another reason to keep External-2 in route domain 0.
+CFE on GitHub (releases and issues): the latest RPMs and known issues.
+Alternative architectures
+
+BIG-IP integration with AWS Gateway Load Balancer (DevCentral): the GWLB option, where BIG-IP doesn't own the public IPs.
+BIG-IP SSLO in AWS: inbound L3 with GWLB (DevCentral): a practical GWLB lab. It notes BIG-IP must be version 16.1 or higher to support the Geneve encapsulation GWLB uses.
+AWS HA across AZs without EIPs (DevCentral): for internal-only apps, a design that uses route tables instead of EIPs, which frees up EIPs.
+F5 BIG-IP VE HA Partner Solution on AWS (AWS Quick Start): a reference CloudFormation deployment that uses CFE.
+Worth looking up in MyF5 (my.f5.com)
+I couldn't confirm exact article numbers, so search MyF5 for:
+
+"Auto Last Hop" for how BIG-IP returns traffic out the ingress VLAN, which is key for External-2 routing symmetry.
+"BIG-IP VE supported platforms" for maximum NICs and c5n/ENA support for your version.
+"BIG-IP VE add network interface AWS" for the reboot requirement and interface mapping after adding a NIC.
+
